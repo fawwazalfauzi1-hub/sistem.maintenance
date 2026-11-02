@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from datetime import datetime, timedelta
 import sqlite3
 import os
 
@@ -24,7 +25,7 @@ def init_db():
         )
     """)
     
-    # 2. Tabel Riwayat Pengerjaan (History Logs) - Ditambahkan kolom category, fotoBefore, fotoAfter
+    # 2. Tabel Riwayat Pengerjaan (History Logs)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS maintenance_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +188,29 @@ class HistorySchema(BaseModel):
     fotoBefore: str | None = None
     fotoAfter: str | None = None
 
+# Fungsi Bantu Menghitung Tanggal Jatuh Tempo Berikutnya
+def calculate_next_due_date(last_done_str: str, interval_text: str) -> str:
+    try:
+        last_done_date = datetime.strptime(last_done_str, "%Y-%m-%d")
+    except ValueError:
+        last_done_date = datetime.now()
+
+    interval_lower = interval_text.lower()
+    
+    if "bulan" in interval_lower:
+        num_months = int(''.join(filter(str.isdigit, interval_text)) or 1)
+        next_date = last_done_date + timedelta(days=30 * num_months)
+    elif "tahun" in interval_lower:
+        num_years = int(''.join(filter(str.isdigit, interval_text)) or 1)
+        next_date = last_done_date + timedelta(days=365 * num_years)
+    elif "minggu" in interval_lower:
+        num_weeks = int(''.join(filter(str.isdigit, interval_text)) or 1)
+        next_date = last_done_date + timedelta(weeks=num_weeks)
+    else:
+        next_date = last_done_date + timedelta(days=30)
+
+    return next_date.strftime("%Y-%m-%d")
+
 @app.get("/")
 def read_root():
     return {"message": "Backend FastAPI Moulding Maintenance System Berjalan Normal!"}
@@ -265,6 +289,8 @@ def get_history():
 def add_history(history: HistorySchema):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    
+    # 1. Simpan riwayat pengerjaan
     cursor.execute("""
         INSERT INTO maintenance_history (task_id, taskName, mouldingCode, category, operatorName, tanggalPengerjaan, catatan, status, fotoBefore, fotoAfter)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -280,6 +306,26 @@ def add_history(history: HistorySchema):
         history.fotoBefore,
         history.fotoAfter
     ))
+    
+    # 2. Otomatis update task utama (lastDone & nextDueDate) agar status Overdue hilang & bergeser
+    if history.task_id:
+        cursor.execute("SELECT intervalText FROM maintenance_tasks WHERE id = ?", (history.task_id,))
+        task_row = cursor.fetchone()
+        
+        if task_row:
+            interval_text = task_row[0]
+            tanggal_pengerjaan = history.tanggalPengerjaan
+            
+            # Hitung otomatis tanggal jatuh tempo berikutnya
+            new_next_due = calculate_next_due_date(tanggal_pengerjaan, interval_text)
+            
+            # Update database tasks utama
+            cursor.execute("""
+                UPDATE maintenance_tasks
+                SET lastDone = ?, nextDueDate = ?
+                WHERE id = ?
+            """, (tanggal_pengerjaan, new_next_due, history.task_id))
+
     conn.commit()
     conn.close()
-    return {"message": "Riwayat pengerjaan berhasil disimpan ke database"}
+    return {"message": "Riwayat pengerjaan berhasil disimpan dan jadwal task berhasil diperbarui secara otomatis!"}
